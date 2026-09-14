@@ -386,10 +386,13 @@ const DEFAULT_ENTREPRISE = "Woligoube Agro-Élevage";
 const state = {
   authed:false,
   user:null,
+  userRole:null,
+  currentUserId:null,
   settings:{ entreprise:DEFAULT_ENTREPRISE, adresse:'', telephone:'', email:'', devise:'GNF', logo:DEFAULT_LOGO, signature:DEFAULT_SIGNATURE },
-  employees:[], salaries:[], transactions:[], activities:[], invoices:[],
+  employees:[], salaries:[], transactions:[], activities:[], invoices:[], users:[],
   currentPage:'dashboard'
 };
+function isAdmin(){ return state.userRole === 'admin'; }
 
 function uid(){ return (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Date.now()+'-'+Math.random().toString(16).slice(2)); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -452,12 +455,12 @@ try{
 
 function companyDocRef(code){ return fbDb.collection('entreprises').doc(code); }
 
-async function loadAuth(){
+async function loadUsers(){
   if(fbEnabled && fbCompanyCode){
     const snap = await companyDocRef(fbCompanyCode).get();
-    return snap.exists ? (snap.data().auth || null) : null;
+    return snap.exists ? (snap.data().users || []) : null;
   }
-  return await storeGet('agro:auth');
+  return await storeGet('agro:users');
 }
 
 function applyRemoteData(d){
@@ -472,6 +475,7 @@ function applyRemoteData(d){
   state.transactions = d.transactions || [];
   state.activities = d.activities || [];
   state.invoices = d.invoices || [];
+  state.users = d.users || state.users || [];
   if(settingsChanged) persist('agro:settings');
 }
 
@@ -493,18 +497,20 @@ async function loadAllData(){
     subscribeRealtime();
     return;
   }
-  const [settings, employees, salaries, transactions, activities, invoices] = await Promise.all([
+  const [settings, employees, salaries, transactions, activities, invoices, users] = await Promise.all([
     storeGet('agro:settings'), storeGet('agro:employees'), storeGet('agro:salaries'),
-    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices')
+    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices'), storeGet('agro:users')
   ]);
-  applyRemoteData({ settings, employees, salaries, transactions, activities, invoices });
+  applyRemoteData({ settings, employees, salaries, transactions, activities, invoices, users });
 }
 
 async function persist(key){
   const map = { 'agro:settings':state.settings, 'agro:employees':state.employees, 'agro:salaries':state.salaries,
-    'agro:transactions':state.transactions, 'agro:activities':state.activities, 'agro:invoices':state.invoices };
+    'agro:transactions':state.transactions, 'agro:activities':state.activities, 'agro:invoices':state.invoices,
+    'agro:users':state.users };
   const fieldMap = { 'agro:settings':'settings', 'agro:employees':'employees', 'agro:salaries':'salaries',
-    'agro:transactions':'transactions', 'agro:activities':'activities', 'agro:invoices':'invoices' };
+    'agro:transactions':'transactions', 'agro:activities':'activities', 'agro:invoices':'invoices',
+    'agro:users':'users' };
   document.getElementById('sync-label').textContent = 'Enregistrement…';
   let ok = true;
   if(fbEnabled && fbCompanyCode){
@@ -544,27 +550,27 @@ async function handleSignup(){
   if(pass.length < 6) return setErr('signup-error','Le mot de passe doit contenir au moins 6 caractères.');
   if(pass !== pass2) return setErr('signup-error','Les mots de passe ne correspondent pas.');
   const passwordHash = await sha256(pass);
-  const auth = { username, email, passwordHash, entreprise, createdAt: todayISO() };
+  const adminUser = { id:uid(), username, email, passwordHash, role:'admin', active:true, entreprise, createdAt: todayISO() };
 
   if(fbEnabled){
     try{
       const ref = companyDocRef(code);
       const snap = await ref.get();
-      if(snap.exists && snap.data().auth) return setErr('signup-error',"Ce code d'entreprise existe déjà. Connectez-vous, ou choisissez un autre code.");
+      if(snap.exists && (snap.data().users||[]).length) return setErr('signup-error',"Ce code d'entreprise existe déjà. Connectez-vous, ou choisissez un autre code.");
       const initialSettings = { entreprise, adresse:'', telephone:'', email:'', devise:'GNF', logo:DEFAULT_LOGO, signature:DEFAULT_SIGNATURE };
-      await ref.set({ auth, settings: initialSettings, employees:[], salaries:[], transactions:[], activities:[], invoices:[] });
+      await ref.set({ users:[adminUser], settings: initialSettings, employees:[], salaries:[], transactions:[], activities:[], invoices:[] });
       fbCompanyCode = code;
       window.localStorage.setItem('agro:company-code', code);
     }catch(e){ console.error(e); return setErr('signup-error','Échec de la connexion au serveur. Vérifiez votre connexion internet.'); }
   } else {
-    const existing = await storeGet('agro:auth');
-    if(existing) return setErr('signup-error','Un compte existe déjà sur cet espace. Connectez-vous.');
-    await storeSet('agro:auth', auth);
+    const existingUsers = await storeGet('agro:users');
+    if(existingUsers && existingUsers.length) return setErr('signup-error','Un compte existe déjà sur cet espace. Connectez-vous.');
+    await storeSet('agro:users', [adminUser]);
     state.settings.entreprise = entreprise;
     await storeSet('agro:settings', state.settings);
   }
   toast('Compte créé.');
-  await completeLogin({username, email});
+  await completeLogin(adminUser);
 }
 
 async function handleLogin(){
@@ -574,26 +580,30 @@ async function handleLogin(){
   const pass = document.getElementById('login-pass').value;
   if(!idVal || !pass) return setErr('login-error','Renseignez vos identifiants.');
   if(fbEnabled && !code) return setErr('login-error',"Renseignez le code d'entreprise.");
-  let auth;
+  let users;
   if(fbEnabled){
     try{
       const snap = await companyDocRef(code).get();
       if(!snap.exists) return setErr('login-error','Aucune entreprise trouvée avec ce code.');
-      auth = snap.data().auth;
+      users = snap.data().users || [];
     }catch(e){ console.error(e); return setErr('login-error','Échec de la connexion au serveur. Vérifiez votre connexion internet.'); }
   } else {
-    auth = await loadAuth();
+    users = await loadUsers();
   }
-  if(!auth) return setErr('login-error','Aucun compte trouvé. Créez-en un.');
+  if(!users || !users.length) return setErr('login-error','Aucun compte trouvé. Créez-en un.');
   const hash = await sha256(pass);
-  const idMatch = (idVal === auth.username) || (idVal.toLowerCase() === (auth.email||'').toLowerCase());
-  if(!idMatch || hash !== auth.passwordHash) return setErr('login-error','Identifiant ou mot de passe incorrect.');
+  const match = users.find(u => ((idVal === u.username) || (idVal.toLowerCase() === (u.email||'').toLowerCase())) && hash === u.passwordHash);
+  if(!match) return setErr('login-error','Identifiant ou mot de passe incorrect.');
+  if(match.active === false) return setErr('login-error','Ce compte a été désactivé par un administrateur.');
   if(fbEnabled){ fbCompanyCode = code; window.localStorage.setItem('agro:company-code', code); }
-  await completeLogin(auth);
+  state.users = users;
+  await completeLogin(match);
 }
 
 async function completeLogin(user){
   state.user = user;
+  state.userRole = user.role || 'admin';
+  state.currentUserId = user.id || null;
   state.authed = true;
   await loadAllData();
   document.getElementById('auth-screen').style.display='none';
@@ -610,6 +620,8 @@ async function completeLogin(user){
 
 function logout(){
   state.authed = false;
+  state.userRole = null;
+  state.currentUserId = null;
   stopAutoSync();
   if(fbUnsub){ fbUnsub(); fbUnsub = null; }
   document.getElementById('app-shell').classList.remove('active');
@@ -1507,7 +1519,7 @@ function renderParametres(){
 
     <div class="panel">
       <div class="panel-head"><h2>Sécurité</h2></div>
-      <p style="font-size:13px;color:var(--ink-soft);margin-top:0;">Changez le mot de passe utilisé pour accéder à cet espace sur tous vos appareils.</p>
+      <p style="font-size:13px;color:var(--ink-soft);margin-top:0;">Changez le mot de passe utilisé pour accéder à votre propre compte.</p>
       <div class="form-grid">
         <div class="field"><label>Nouveau mot de passe</label><input id="p-newpass" type="password"></div>
         <div class="field"><label>Confirmer</label><input id="p-newpass2" type="password"></div>
@@ -1516,6 +1528,8 @@ function renderParametres(){
         <button class="btn btn-outline" onclick="changePassword()">Mettre à jour le mot de passe</button>
       </div>
     </div>
+
+    ${renderUsersPanel()}
   `;
 }
 
@@ -1544,12 +1558,104 @@ async function changePassword(){
   const p2 = document.getElementById('p-newpass2').value;
   if(p1.length<6) return toast('6 caractères minimum.');
   if(p1!==p2) return toast('Les mots de passe ne correspondent pas.');
-  const auth = await loadAuth();
-  auth.passwordHash = await sha256(p1);
-  if(fbEnabled && fbCompanyCode){ await companyDocRef(fbCompanyCode).set({ auth }, { merge:true }); }
-  else { await storeSet('agro:auth', auth); }
+  const me = state.users.find(u=>u.id===state.currentUserId);
+  if(!me) return toast('Compte introuvable.');
+  me.passwordHash = await sha256(p1);
+  await persist('agro:users');
   document.getElementById('p-newpass').value=''; document.getElementById('p-newpass2').value='';
   toast('Mot de passe mis à jour.');
+}
+
+/* ============================================================
+   GESTION DES COMPTES UTILISATEURS (admin uniquement)
+   ============================================================ */
+function renderUsersPanel(){
+  if(!isAdmin()) return '';
+  const rows = state.users.map(u=>`
+    <tr>
+      <td>${esc(u.username)}${u.id===state.currentUserId ? ' <span style="color:var(--ink-soft);font-size:12px;">(vous)</span>' : ''}</td>
+      <td>${esc(u.email||'—')}</td>
+      <td>${u.role==='admin' ? 'Administrateur' : 'Employé'}</td>
+      <td>${u.active===false ? '<span style="color:#b3452f;">Bloqué</span>' : '<span style="color:var(--ok);">Actif</span>'}</td>
+      <td style="text-align:right;">
+        ${u.id!==state.currentUserId ? `<div class="row-actions">
+          <button class="icon-btn" onclick="toggleUserActive('${u.id}')">${u.active===false?'Réactiver':'Bloquer'}</button>
+          <button class="icon-btn danger" onclick="deleteUser('${u.id}')">Supprimer</button>
+        </div>` : '<span style="color:var(--ink-soft);font-size:12px;">—</span>'}
+      </td>
+    </tr>`).join('');
+  return `
+    <div class="panel">
+      <div class="panel-head"><h2>Comptes utilisateurs</h2><button class="btn btn-primary btn-sm" onclick="openAddUserModal()">+ Ajouter un utilisateur</button></div>
+      <p style="font-size:13px;color:var(--ink-soft);margin-top:0;">Créez un accès pour chaque personne qui doit utiliser cette application. Vous pouvez bloquer un compte à tout moment sans le supprimer.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Identifiant</th><th>E-mail</th><th>Rôle</th><th>Statut</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+}
+
+function openAddUserModal(){
+  openModal(`
+    <h3>Ajouter un utilisateur</h3>
+    <div class="auth-error" id="newuser-error"></div>
+    <div class="form-grid">
+      <div class="field full"><label>Identifiant</label><input id="nu-username" placeholder="ex : mfall"></div>
+      <div class="field full"><label>E-mail (optionnel)</label><input id="nu-email" type="email"></div>
+      <div class="field full"><label>Rôle</label>
+        <select id="nu-role">
+          <option value="employe">Employé (accès à l'application, sans gestion des comptes)</option>
+          <option value="admin">Administrateur (accès complet)</option>
+        </select>
+      </div>
+      <div class="field"><label>Mot de passe temporaire</label><input id="nu-pass" type="password" placeholder="6 caractères minimum"></div>
+      <div class="field"><label>Confirmer</label><input id="nu-pass2" type="password"></div>
+    </div>
+    <p style="font-size:12.5px;color:var(--ink-soft);">Communiquez cet identifiant et ce mot de passe à la personne concernée. Elle pourra le changer elle-même depuis Paramètres → Sécurité une fois connectée.</p>
+    <div class="modal-foot">
+      <button class="btn btn-outline" onclick="closeModal()">Annuler</button>
+      <button class="btn btn-primary" onclick="createUser()">Créer le compte</button>
+    </div>
+  `);
+}
+
+async function createUser(){
+  const setE = (m)=>{ const el=document.getElementById('newuser-error'); el.textContent=m; el.classList.toggle('show', !!m); };
+  setE('');
+  const username = document.getElementById('nu-username').value.trim();
+  const email = document.getElementById('nu-email').value.trim();
+  const role = document.getElementById('nu-role').value;
+  const pass = document.getElementById('nu-pass').value;
+  const pass2 = document.getElementById('nu-pass2').value;
+  if(!username) return setE('Identifiant requis.');
+  if(pass.length<6) return setE('6 caractères minimum.');
+  if(pass!==pass2) return setE('Les mots de passe ne correspondent pas.');
+  if(state.users.some(u=>u.username.toLowerCase()===username.toLowerCase())) return setE('Cet identifiant existe déjà.');
+  const passwordHash = await sha256(pass);
+  state.users.push({ id:uid(), username, email, passwordHash, role, active:true, createdAt: todayISO() });
+  await persist('agro:users');
+  closeModal();
+  toast('Compte créé pour '+username+'.');
+  renderParametres();
+}
+
+async function toggleUserActive(id){
+  const u = state.users.find(x=>x.id===id);
+  if(!u) return;
+  u.active = u.active===false ? true : false;
+  await persist('agro:users');
+  toast(u.active ? 'Compte réactivé.' : 'Compte bloqué.');
+  renderParametres();
+}
+
+async function deleteUser(id){
+  const remainingAdmins = state.users.filter(u=>u.role==='admin' && u.id!==id).length;
+  const target = state.users.find(u=>u.id===id);
+  if(target && target.role==='admin' && remainingAdmins===0) return toast('Impossible : il doit rester au moins un administrateur.');
+  state.users = state.users.filter(u=>u.id!==id);
+  await persist('agro:users');
+  toast('Compte supprimé.');
+  renderParametres();
 }
 
 /* ============================================================
@@ -1567,8 +1673,8 @@ async function changePassword(){
     document.getElementById('signup-code').value = savedCode;
     showLogin();
   } else {
-    const auth = await loadAuth();
-    if(!auth) showSignup(); else showLogin();
+    const users = await loadUsers();
+    if(!users || !users.length) showSignup(); else showLogin();
   }
   document.getElementById('login-user').addEventListener('keydown', e=>{ if(e.key==='Enter') handleLogin(); });
   document.getElementById('login-pass').addEventListener('keydown', e=>{ if(e.key==='Enter') handleLogin(); });
