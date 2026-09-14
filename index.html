@@ -7,6 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;0,700;1,500&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --forest:#243527;
@@ -311,6 +313,7 @@
       <h1>Content de vous revoir</h1>
       <p class="sub">Connectez-vous pour piloter votre exploitation.</p>
       <div class="auth-error" id="login-error"></div>
+      <div class="field" id="login-code-field"><label>Code d'entreprise</label><input type="text" id="login-code" placeholder="ex : ferme-diallo" autocomplete="off"></div>
       <div class="field"><label>Identifiant ou e-mail</label><input type="text" id="login-user" autocomplete="username"></div>
       <div class="field"><label>Mot de passe</label><input type="password" id="login-pass" autocomplete="current-password"></div>
       <button class="btn btn-primary btn-block" onclick="handleLogin()">Se connecter</button>
@@ -321,6 +324,7 @@
       <h1>Configurer votre espace</h1>
       <p class="sub">Créez le compte administrateur de votre exploitation.</p>
       <div class="auth-error" id="signup-error"></div>
+      <div class="field" id="signup-code-field"><label>Code d'entreprise (à réutiliser sur vos autres appareils)</label><input type="text" id="signup-code" placeholder="ex : ferme-diallo" autocomplete="off"></div>
       <div class="field"><label>Nom de l'exploitation</label><input type="text" id="signup-company" placeholder="Ferme Kandé" value="Woligoube Agro-Élevage"></div>
       <div class="field"><label>Identifiant</label><input type="text" id="signup-user" autocomplete="username" placeholder="ex : jkande"></div>
       <div class="field"><label>E-mail</label><input type="email" id="signup-email" autocomplete="email"></div>
@@ -402,7 +406,7 @@ async function sha256(text){
 }
 
 /* ============================================================
-   STOCKAGE PERSISTANT (window.storage)
+   STOCKAGE PERSISTANT (local, secours hors-ligne)
    ============================================================ */
 async function storeGet(key){
   try{
@@ -414,36 +418,102 @@ async function storeSet(key, value){
   try{
     window.localStorage.setItem(key, JSON.stringify(value));
     return true;
-  }catch(e){ console.error('storage set failed', key, e); toast('Échec de la sauvegarde — réessayez.'); return false; }
+  }catch(e){ console.error('storage set failed', key, e); return false; }
 }
 
-async function loadAuth(){ return await storeGet('agro:auth'); }
+/* ============================================================
+   FIREBASE — SYNCHRONISATION TEMPS RÉEL MULTI-APPAREILS
+   ============================================================
+   Pour activer la synchronisation en ligne :
+   1) Créez un projet gratuit sur https://console.firebase.google.com
+   2) Activez "Firestore Database" (mode production ou test)
+   3) Copiez la configuration de votre projet (Paramètres du projet ⚙ >
+      Vos applications > Config) et collez-la ci-dessous, à la place
+      des valeurs "REMPLACER...".
+   Tant que ces valeurs ne sont pas remplacées, l'application continue
+   de fonctionner normalement, mais uniquement sur cet appareil.
+   ============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyCQVoQ5CYaRYS7IAYqXKwXlxU8Fzh3v8IU",
+  authDomain: "woligestion.firebaseapp.com",
+  projectId: "woligestion",
+  storageBucket: "woligestion.firebasestorage.app",
+  messagingSenderId: "427002006577",
+  appId: "1:427002006577:web:f15f0346c9fe8df4e11910"
+};
+let fbDb = null, fbEnabled = false, fbUnsub = null, fbCompanyCode = null;
+try{
+  if(firebaseConfig.apiKey && !String(firebaseConfig.apiKey).startsWith('REMPLACER')){
+    firebase.initializeApp(firebaseConfig);
+    fbDb = firebase.firestore();
+    fbEnabled = true;
+  }
+}catch(e){ console.error('Firebase init failed', e); }
 
-async function loadAllData(){
-  const [settings, employees, salaries, transactions, activities, invoices] = await Promise.all([
-    storeGet('agro:settings'), storeGet('agro:employees'), storeGet('agro:salaries'),
-    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices')
-  ]);
-  state.settings = settings || state.settings;
+function companyDocRef(code){ return fbDb.collection('entreprises').doc(code); }
+
+async function loadAuth(){
+  if(fbEnabled && fbCompanyCode){
+    const snap = await companyDocRef(fbCompanyCode).get();
+    return snap.exists ? (snap.data().auth || null) : null;
+  }
+  return await storeGet('agro:auth');
+}
+
+function applyRemoteData(d){
+  state.settings = d.settings || state.settings;
   let settingsChanged = false;
   if(!state.settings.logo){ state.settings.logo = DEFAULT_LOGO; settingsChanged = true; }
   if(!state.settings.signature){ state.settings.signature = DEFAULT_SIGNATURE; settingsChanged = true; }
   if(!state.settings.entreprise){ state.settings.entreprise = DEFAULT_ENTREPRISE; settingsChanged = true; }
   if(!state.settings.devise || state.settings.devise==='FCFA'){ state.settings.devise = 'GNF'; settingsChanged = true; }
-  if(settingsChanged) await storeSet('agro:settings', state.settings);
-  state.employees = employees || [];
-  state.salaries = salaries || [];
-  state.transactions = transactions || [];
-  state.activities = activities || [];
-  state.invoices = invoices || [];
+  state.employees = d.employees || [];
+  state.salaries = d.salaries || [];
+  state.transactions = d.transactions || [];
+  state.activities = d.activities || [];
+  state.invoices = d.invoices || [];
+  if(settingsChanged) persist('agro:settings');
 }
 
-async function persist(key, dataKey){
+function subscribeRealtime(){
+  if(fbUnsub){ fbUnsub(); fbUnsub = null; }
+  fbUnsub = companyDocRef(fbCompanyCode).onSnapshot(snap=>{
+    if(!snap.exists || !state.authed) return;
+    applyRemoteData(snap.data());
+    document.getElementById('brand-name').textContent = state.settings.entreprise || 'AgroGestion';
+    document.getElementById('sync-label').textContent = 'Synchronisé en ligne';
+    render();
+  }, err=>{ console.error('snapshot error', err); document.getElementById('sync-label').textContent = 'Connexion interrompue'; });
+}
+
+async function loadAllData(){
+  if(fbEnabled && fbCompanyCode){
+    const snap = await companyDocRef(fbCompanyCode).get();
+    applyRemoteData(snap.exists ? snap.data() : {});
+    subscribeRealtime();
+    return;
+  }
+  const [settings, employees, salaries, transactions, activities, invoices] = await Promise.all([
+    storeGet('agro:settings'), storeGet('agro:employees'), storeGet('agro:salaries'),
+    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices')
+  ]);
+  applyRemoteData({ settings, employees, salaries, transactions, activities, invoices });
+}
+
+async function persist(key){
   const map = { 'agro:settings':state.settings, 'agro:employees':state.employees, 'agro:salaries':state.salaries,
     'agro:transactions':state.transactions, 'agro:activities':state.activities, 'agro:invoices':state.invoices };
+  const fieldMap = { 'agro:settings':'settings', 'agro:employees':'employees', 'agro:salaries':'salaries',
+    'agro:transactions':'transactions', 'agro:activities':'activities', 'agro:invoices':'invoices' };
   document.getElementById('sync-label').textContent = 'Enregistrement…';
-  const ok = await storeSet(key, map[key]);
-  document.getElementById('sync-label').textContent = ok ? 'Enregistré sur cet appareil' : 'Échec de l\'enregistrement';
+  let ok = true;
+  if(fbEnabled && fbCompanyCode){
+    try{
+      await companyDocRef(fbCompanyCode).set({ [fieldMap[key]]: map[key] }, { merge:true });
+    }catch(e){ console.error('cloud save failed', e); ok = false; toast('Échec de la synchronisation — vérifiez votre connexion.'); }
+  }
+  await storeSet(key, map[key]);
+  document.getElementById('sync-label').textContent = ok ? (fbEnabled ? 'Synchronisé en ligne' : 'Enregistré sur cet appareil') : 'Échec de la synchronisation';
 }
 
 /* ============================================================
@@ -459,37 +529,66 @@ function showLogin(){
 }
 function setErr(id, msg){ const el=document.getElementById(id); el.textContent=msg; el.classList.toggle('show', !!msg); }
 
+function normalizeCode(v){ return String(v||'').trim().toLowerCase().replace(/\s+/g,'-'); }
+
 async function handleSignup(){
   setErr('signup-error','');
+  const code = fbEnabled ? normalizeCode(document.getElementById('signup-code').value) : null;
   const entreprise = document.getElementById('signup-company').value.trim();
   const username = document.getElementById('signup-user').value.trim();
   const email = document.getElementById('signup-email').value.trim();
   const pass = document.getElementById('signup-pass').value;
   const pass2 = document.getElementById('signup-pass2').value;
+  if(fbEnabled && !code) return setErr('signup-error',"Choisissez un code d'entreprise (ex : ferme-diallo).");
   if(!username || !pass) return setErr('signup-error','Identifiant et mot de passe requis.');
   if(pass.length < 6) return setErr('signup-error','Le mot de passe doit contenir au moins 6 caractères.');
   if(pass !== pass2) return setErr('signup-error','Les mots de passe ne correspondent pas.');
-  const existing = await loadAuth();
-  if(existing) return setErr('signup-error','Un compte existe déjà sur cet espace. Connectez-vous.');
   const passwordHash = await sha256(pass);
   const auth = { username, email, passwordHash, entreprise, createdAt: todayISO() };
-  await storeSet('agro:auth', auth);
-  state.settings.entreprise = entreprise;
-  await storeSet('agro:settings', state.settings);
+
+  if(fbEnabled){
+    try{
+      const ref = companyDocRef(code);
+      const snap = await ref.get();
+      if(snap.exists && snap.data().auth) return setErr('signup-error',"Ce code d'entreprise existe déjà. Connectez-vous, ou choisissez un autre code.");
+      const initialSettings = { entreprise, adresse:'', telephone:'', email:'', devise:'GNF', logo:DEFAULT_LOGO, signature:DEFAULT_SIGNATURE };
+      await ref.set({ auth, settings: initialSettings, employees:[], salaries:[], transactions:[], activities:[], invoices:[] });
+      fbCompanyCode = code;
+      window.localStorage.setItem('agro:company-code', code);
+    }catch(e){ console.error(e); return setErr('signup-error','Échec de la connexion au serveur. Vérifiez votre connexion internet.'); }
+  } else {
+    const existing = await storeGet('agro:auth');
+    if(existing) return setErr('signup-error','Un compte existe déjà sur cet espace. Connectez-vous.');
+    await storeSet('agro:auth', auth);
+    state.settings.entreprise = entreprise;
+    await storeSet('agro:settings', state.settings);
+  }
   toast('Compte créé.');
   await completeLogin({username, email});
 }
 
 async function handleLogin(){
   setErr('login-error','');
+  const code = fbEnabled ? normalizeCode(document.getElementById('login-code').value) : null;
   const idVal = document.getElementById('login-user').value.trim();
   const pass = document.getElementById('login-pass').value;
   if(!idVal || !pass) return setErr('login-error','Renseignez vos identifiants.');
-  const auth = await loadAuth();
+  if(fbEnabled && !code) return setErr('login-error',"Renseignez le code d'entreprise.");
+  let auth;
+  if(fbEnabled){
+    try{
+      const snap = await companyDocRef(code).get();
+      if(!snap.exists) return setErr('login-error','Aucune entreprise trouvée avec ce code.');
+      auth = snap.data().auth;
+    }catch(e){ console.error(e); return setErr('login-error','Échec de la connexion au serveur. Vérifiez votre connexion internet.'); }
+  } else {
+    auth = await loadAuth();
+  }
   if(!auth) return setErr('login-error','Aucun compte trouvé. Créez-en un.');
   const hash = await sha256(pass);
   const idMatch = (idVal === auth.username) || (idVal.toLowerCase() === (auth.email||'').toLowerCase());
   if(!idMatch || hash !== auth.passwordHash) return setErr('login-error','Identifiant ou mot de passe incorrect.');
+  if(fbEnabled){ fbCompanyCode = code; window.localStorage.setItem('agro:company-code', code); }
   await completeLogin(auth);
 }
 
@@ -512,6 +611,7 @@ async function completeLogin(user){
 function logout(){
   state.authed = false;
   stopAutoSync();
+  if(fbUnsub){ fbUnsub(); fbUnsub = null; }
   document.getElementById('app-shell').classList.remove('active');
   document.getElementById('auth-screen').style.display='flex';
   document.getElementById('login-user').value='';
@@ -519,9 +619,11 @@ function logout(){
   showLogin();
 }
 
-/* Actualisation périodique pour refléter les changements faits depuis un autre appareil */
+/* Actualisation périodique (mode hors-ligne uniquement — en mode Firebase,
+   la synchronisation est déjà instantanée via onSnapshot) */
 let syncTimer=null;
 function startAutoSync(){
+  if(fbEnabled) return;
   syncTimer = setInterval(async ()=>{
     await loadAllData();
     render();
@@ -1444,7 +1546,8 @@ async function changePassword(){
   if(p1!==p2) return toast('Les mots de passe ne correspondent pas.');
   const auth = await loadAuth();
   auth.passwordHash = await sha256(p1);
-  await storeSet('agro:auth', auth);
+  if(fbEnabled && fbCompanyCode){ await companyDocRef(fbCompanyCode).set({ auth }, { merge:true }); }
+  else { await storeSet('agro:auth', auth); }
   document.getElementById('p-newpass').value=''; document.getElementById('p-newpass2').value='';
   toast('Mot de passe mis à jour.');
 }
@@ -1454,8 +1557,19 @@ async function changePassword(){
    ============================================================ */
 (async function init(){
   document.getElementById('auth-logo-img').src = DEFAULT_LOGO;
-  const auth = await loadAuth();
-  if(!auth) showSignup(); else showLogin();
+  if(!fbEnabled){
+    document.getElementById('login-code-field').style.display = 'none';
+    document.getElementById('signup-code-field').style.display = 'none';
+  }
+  if(fbEnabled){
+    const savedCode = window.localStorage.getItem('agro:company-code') || '';
+    document.getElementById('login-code').value = savedCode;
+    document.getElementById('signup-code').value = savedCode;
+    showLogin();
+  } else {
+    const auth = await loadAuth();
+    if(!auth) showSignup(); else showLogin();
+  }
   document.getElementById('login-user').addEventListener('keydown', e=>{ if(e.key==='Enter') handleLogin(); });
   document.getElementById('login-pass').addEventListener('keydown', e=>{ if(e.key==='Enter') handleLogin(); });
 })();
