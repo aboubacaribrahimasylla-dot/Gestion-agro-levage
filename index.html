@@ -389,7 +389,7 @@ const state = {
   userRole:null,
   currentUserId:null,
   settings:{ entreprise:DEFAULT_ENTREPRISE, adresse:'', telephone:'', email:'', devise:'GNF', logo:DEFAULT_LOGO, signature:DEFAULT_SIGNATURE },
-  employees:[], salaries:[], transactions:[], activities:[], invoices:[], users:[],
+  employees:[], salaries:[], transactions:[], activities:[], invoices:[], ventesBetail:[], users:[],
   currentPage:'dashboard'
 };
 function isAdmin(){ return state.userRole === 'admin'; }
@@ -475,6 +475,7 @@ function applyRemoteData(d){
   state.transactions = d.transactions || [];
   state.activities = d.activities || [];
   state.invoices = d.invoices || [];
+  state.ventesBetail = d.ventesBetail || [];
   state.users = d.users || state.users || [];
   if(settingsChanged) persist('agro:settings');
 }
@@ -497,20 +498,21 @@ async function loadAllData(){
     subscribeRealtime();
     return;
   }
-  const [settings, employees, salaries, transactions, activities, invoices, users] = await Promise.all([
+  const [settings, employees, salaries, transactions, activities, invoices, ventesBetail, users] = await Promise.all([
     storeGet('agro:settings'), storeGet('agro:employees'), storeGet('agro:salaries'),
-    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices'), storeGet('agro:users')
+    storeGet('agro:transactions'), storeGet('agro:activities'), storeGet('agro:invoices'),
+    storeGet('agro:ventesBetail'), storeGet('agro:users')
   ]);
-  applyRemoteData({ settings, employees, salaries, transactions, activities, invoices, users });
+  applyRemoteData({ settings, employees, salaries, transactions, activities, invoices, ventesBetail, users });
 }
 
 async function persist(key){
   const map = { 'agro:settings':state.settings, 'agro:employees':state.employees, 'agro:salaries':state.salaries,
     'agro:transactions':state.transactions, 'agro:activities':state.activities, 'agro:invoices':state.invoices,
-    'agro:users':state.users };
+    'agro:ventesBetail':state.ventesBetail, 'agro:users':state.users };
   const fieldMap = { 'agro:settings':'settings', 'agro:employees':'employees', 'agro:salaries':'salaries',
     'agro:transactions':'transactions', 'agro:activities':'activities', 'agro:invoices':'invoices',
-    'agro:users':'users' };
+    'agro:ventesBetail':'ventesBetail', 'agro:users':'users' };
   document.getElementById('sync-label').textContent = 'Enregistrement…';
   let ok = true;
   if(fbEnabled && fbCompanyCode){
@@ -653,6 +655,7 @@ const PAGES = [
   {id:'finances', label:'Finances', icon:'◇', meta:'Entrées et sorties d’argent'},
   {id:'activites', label:'Activités', icon:'◐', meta:'Journal des opérations agricoles'},
   {id:'factures', label:'Factures', icon:'▤', meta:'Factures et documents imprimables'},
+  {id:'ventesBetail', label:'Vente de bétail', icon:'❖', meta:'Ventes d’animaux : bovins, ovins, caprins…'},
   {id:'parametres', label:'Paramètres', icon:'⚙', meta:'Identité, logo et signature'}
 ];
 
@@ -674,7 +677,7 @@ function toggleSidebar(){ document.getElementById('sidebar').classList.toggle('o
 
 function render(){
   const map = { dashboard:renderDashboard, personnel:renderPersonnel, salaires:renderSalaires,
-    finances:renderFinances, activites:renderActivites, factures:renderFactures, parametres:renderParametres };
+    finances:renderFinances, activites:renderActivites, factures:renderFactures, ventesBetail:renderVentesBetail, parametres:renderParametres };
   (map[state.currentPage] || renderDashboard)();
 }
 
@@ -1476,6 +1479,94 @@ function openShareFallback(subject, shareText){
     </div>
     <div class="modal-foot"><button class="btn btn-ghost" onclick="closeModal()">Fermer</button></div>
   `);
+}
+
+/* ============================================================
+   VENTE DE BÉTAIL
+   ============================================================ */
+const TYPES_BETAIL = ['Taureau','Vache','Bœuf','Mouton','Chèvre','Veau','Agneau','Chevreau','Autre'];
+
+function renderVentesBetail(){
+  const rows = [...state.ventesBetail].sort((a,b)=>b.date.localeCompare(a.date));
+  const total = rows.reduce((s,v)=>s+Number(v.prix||0),0);
+  document.getElementById('content').innerHTML = `
+    <div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:20px;">
+      <div class="stat-card"><div class="label">Ventes enregistrées</div><div class="value">${rows.length}</div></div>
+      <div class="stat-card"><div class="label">Total des ventes</div><div class="value pos">${fmtMoney(total)}</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>Ventes de bétail (${rows.length})</h2>
+        <button class="btn btn-primary btn-sm" onclick="openVenteBetailForm()">+ Nouvelle vente</button>
+      </div>
+      ${rows.length===0 ? emptyState('Aucune vente enregistrée', 'Enregistrez vos ventes de taureaux, moutons, chèvres et autres animaux.') : `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Animal</th><th>Acheteur</th><th>Date</th><th>Prix</th><th></th></tr></thead>
+        <tbody>${rows.map(v=>`
+          <tr>
+            <td><strong>${esc(v.typeAnimal)}</strong></td>
+            <td>${esc(v.acheteur||'—')}</td>
+            <td>${fmtDate(v.date)}</td>
+            <td>${fmtMoney(v.prix)}</td>
+            <td><div class="row-actions">
+              <button class="icon-btn" onclick="openVenteBetailForm('${v.id}')">Modifier</button>
+              <button class="icon-btn danger" onclick="deleteVenteBetail('${v.id}')">Supprimer</button>
+            </div></td>
+          </tr>`).join('')}</tbody>
+      </table></div>`}
+    </div>
+  `;
+}
+
+function openVenteBetailForm(id){
+  const v = id ? state.ventesBetail.find(x=>x.id===id) : null;
+  const isAutre = v && !TYPES_BETAIL.includes(v.typeAnimal);
+  openModal(`
+    <h3>${v?'Modifier la':'Nouvelle'} vente de bétail</h3>
+    <div class="form-grid">
+      <div class="field"><label>Type d'animal</label>
+        <select id="vb-type" onchange="document.getElementById('vb-type-autre').style.display = this.value==='Autre' ? 'block' : 'none';">
+          ${TYPES_BETAIL.map(t=>`<option value="${t}" ${(v&&v.typeAnimal===t)||(isAutre&&t==='Autre')?'selected':''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" id="vb-type-autre" style="display:${isAutre?'block':'none'};">
+        <label>Précisez l'animal</label><input id="vb-type-custom" value="${isAutre?esc(v.typeAnimal):''}" placeholder="ex : cheval">
+      </div>
+      <div class="field"><label>Prix de vente</label><input id="vb-prix" type="number" min="0" value="${v?v.prix:''}"></div>
+      <div class="field"><label>Acheteur</label><input id="vb-acheteur" value="${v?esc(v.acheteur):''}" placeholder="Nom de l'acheteur"></div>
+      <div class="field full"><label>Date</label><input id="vb-date" type="date" value="${v?v.date:todayISO()}"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="closeModal()">Annuler</button>
+      <button class="btn btn-primary" onclick="saveVenteBetail('${v?v.id:''}')">Enregistrer</button>
+    </div>
+  `);
+}
+
+async function saveVenteBetail(id){
+  const typeSelect = document.getElementById('vb-type').value;
+  const typeAnimal = typeSelect==='Autre' ? document.getElementById('vb-type-custom').value.trim() : typeSelect;
+  if(!typeAnimal) return toast("Le type d'animal est requis.");
+  const prix = Number(document.getElementById('vb-prix').value)||0;
+  const acheteur = document.getElementById('vb-acheteur').value.trim();
+  const date = document.getElementById('vb-date').value || todayISO();
+  if(id){
+    const idx = state.ventesBetail.findIndex(v=>v.id===id);
+    state.ventesBetail[idx] = {...state.ventesBetail[idx], typeAnimal, prix, acheteur, date};
+  } else {
+    state.ventesBetail.push({ id: uid(), typeAnimal, prix, acheteur, date });
+    state.transactions.push({ id: uid(), type:'Entrée', categorie:'Vente de bétail', montant: prix, description:`Vente ${typeAnimal}${acheteur?' — '+acheteur:''}`, date });
+    await persist('agro:transactions');
+  }
+  await persist('agro:ventesBetail');
+  closeModal(); toast('Vente enregistrée.'); renderVentesBetail();
+}
+
+async function deleteVenteBetail(id){
+  if(!confirm('Supprimer cette vente ?')) return;
+  state.ventesBetail = state.ventesBetail.filter(v=>v.id!==id);
+  await persist('agro:ventesBetail');
+  toast('Vente supprimée.'); renderVentesBetail();
 }
 
 /* ============================================================
